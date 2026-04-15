@@ -1,3 +1,7 @@
+# ORIGINAL
+
+
+
 # import math
 #
 # import torch
@@ -81,6 +85,101 @@
 #         # out.shape == (batch_size, seq_len, d_model)
 #         out = self.dropout(out)
 #         return out
+
+
+
+
+#Static positional token
+# import math
+#
+# import torch
+# from torch import nn
+# from torch.nn import functional as F
+#
+# from tupe.bias import get_relative_positions
+# from tupe.config import TUPEConfig
+#
+#
+# class TUPEMultiHeadAttention(nn.Module):
+#     def __init__(self, config: TUPEConfig, pos_embed: nn.Module) -> None:
+#         super().__init__()
+#         self.max_len = config.max_len
+#         self.num_heads = config.num_heads
+#         self.num_buckets = config.num_buckets
+#         self.max_distance = config.max_distance
+#         self.bidirectional = config.bidirectional_bias
+#         self.scale = math.sqrt(2 * config.d_head)
+#
+#         self.pos_embed = pos_embed
+#         self.dropout = nn.Dropout(config.dropout)
+#         self.attn_dropout = nn.Dropout(config.dropout)
+#
+#         # kqv in one pass
+#         self.pos_kq = nn.Linear(config.d_model, 2 * config.d_model, bias=False)
+#         self.tok_kqv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
+#
+#         # safer improvement: output projection
+#         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+#
+#         # learn how much token attention and positional attention should contribute
+#         self.tok_alpha = nn.Parameter(torch.tensor(1.0))
+#         self.pos_alpha = nn.Parameter(torch.tensor(0.3))
+#
+#         self.relative_bias = config.relative_bias
+#         if config.relative_bias:
+#             self.bias = nn.Embedding(config.max_len * 2, config.num_heads)
+#
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         batch_size, seq_len, _ = x.shape
+#
+#         pos_embed = self.pos_embed(seq_len).repeat(batch_size, 1, 1)
+#         pos_key, pos_query = self.pos_kq(pos_embed).chunk(2, dim=-1)
+#
+#         pos_key = pos_key.view(batch_size, seq_len, self.num_heads, -1).permute(
+#             0, 2, 3, 1
+#         )
+#         pos_query = pos_query.view(batch_size, seq_len, self.num_heads, -1).transpose(
+#             1, 2
+#         )
+#         pos_attn = torch.matmul(pos_query, pos_key)
+#
+#         tok_key, tok_query, tok_value = self.tok_kqv(x).chunk(3, dim=-1)
+#         tok_key = tok_key.view(batch_size, seq_len, self.num_heads, -1).permute(
+#             0, 2, 3, 1
+#         )
+#         tok_query = tok_query.view(batch_size, seq_len, self.num_heads, -1).transpose(
+#             1, 2
+#         )
+#         tok_value = tok_value.view(batch_size, seq_len, self.num_heads, -1).transpose(
+#             1, 2
+#         )
+#         tok_attn = torch.matmul(tok_query, tok_key)
+#
+#         #attn = (self.tok_alpha * tok_attn + self.pos_alpha * pos_attn) / self.scale
+#         alpha_sum = self.tok_alpha + self.pos_alpha
+#         attn = (self.tok_alpha * tok_attn + self.pos_alpha * pos_attn) / (alpha_sum * self.scale)
+#
+#         if self.relative_bias:
+#             relative_positions = get_relative_positions(
+#                 seq_len, self.bidirectional, self.num_buckets, self.max_distance
+#             ).to(attn.device)
+#
+#             bias = self.bias(relative_positions + self.max_len)
+#             bias = bias.permute(2, 0, 1).unsqueeze(0)
+#             attn = attn + bias
+#
+#         attn = F.softmax(attn, dim=-1)
+#         attn = self.attn_dropout(attn)
+#
+#         out = torch.matmul(attn, tok_value)
+#         out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
+#         out = self.out_proj(out)
+#         out = self.dropout(out)
+#         return out
+
+
+#Gated Positional token
+
 import math
 
 import torch
@@ -92,6 +191,23 @@ from tupe.config import TUPEConfig
 
 
 class TUPEMultiHeadAttention(nn.Module):
+    """
+    TUPE attention with dynamic residual positional gating.
+
+    Instead of:
+        attn = (tok_alpha * tok_attn + pos_alpha * pos_attn) / scale
+
+    we use:
+        attn = (tok_attn + gate * pos_attn) / scale
+
+    where gate is learned dynamically from the input x.
+
+    Why this is safer:
+    - token attention remains dominant
+    - positional attention helps only when useful
+    - less risk of positional over-dominance hurting forecasting
+    """
+
     def __init__(self, config: TUPEConfig, pos_embed: nn.Module) -> None:
         super().__init__()
         self.max_len = config.max_len
@@ -103,67 +219,154 @@ class TUPEMultiHeadAttention(nn.Module):
 
         self.pos_embed = pos_embed
         self.dropout = nn.Dropout(config.dropout)
-        self.attn_dropout = nn.Dropout(config.dropout)
 
         # kqv in one pass
         self.pos_kq = nn.Linear(config.d_model, 2 * config.d_model, bias=False)
         self.tok_kqv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
 
-        # safer improvement: output projection
-        self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-
-        # learn how much token attention and positional attention should contribute
-        self.tok_alpha = nn.Parameter(torch.tensor(1.0))
-        self.pos_alpha = nn.Parameter(torch.tensor(0.3))
-
         self.relative_bias = config.relative_bias
         if config.relative_bias:
-            self.bias = nn.Embedding(config.max_len * 2, config.num_heads)
+            self.bias = nn.Embedding(config.num_buckets, config.num_heads)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
+        # Dynamic gate:
+        # produces one gate per head for each query position
+        # input:  (B, L, D)
+        # output: (B, L, H)
+        self.gate_proj = nn.Linear(config.d_model, config.num_heads)
 
-        pos_embed = self.pos_embed(seq_len).repeat(batch_size, 1, 1)
-        pos_key, pos_query = self.pos_kq(pos_embed).chunk(2, dim=-1)
+        # Initialize gate to start with SMALL positional contribution.
+        # sigmoid(-1.5) ~= 0.18
+        # So initially: attn ≈ tok_attn + 0.18 * pos_attn
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, -1.5)
 
-        pos_key = pos_key.view(batch_size, seq_len, self.num_heads, -1).permute(
-            0, 2, 3, 1
-        )
-        pos_query = pos_query.view(batch_size, seq_len, self.num_heads, -1).transpose(
-            1, 2
-        )
-        pos_attn = torch.matmul(pos_query, pos_key)
+    def _shape(self, x: torch.Tensor, seq_len: int, bsz: int, d_head: int) -> torch.Tensor:
+        """
+        Convert (B, L, D) -> (B, H, L, d_head)
+        """
+        return x.view(bsz, seq_len, self.num_heads, d_head).transpose(1, 2).contiguous()
 
-        tok_key, tok_query, tok_value = self.tok_kqv(x).chunk(3, dim=-1)
-        tok_key = tok_key.view(batch_size, seq_len, self.num_heads, -1).permute(
-            0, 2, 3, 1
-        )
-        tok_query = tok_query.view(batch_size, seq_len, self.num_heads, -1).transpose(
-            1, 2
-        )
-        tok_value = tok_value.view(batch_size, seq_len, self.num_heads, -1).transpose(
-            1, 2
-        )
-        tok_attn = torch.matmul(tok_query, tok_key)
+    def _get_gate(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute dynamic gate from input states.
 
-        #attn = (self.tok_alpha * tok_attn + self.pos_alpha * pos_attn) / self.scale
-        alpha_sum = self.tok_alpha + self.pos_alpha
-        attn = (self.tok_alpha * tok_attn + self.pos_alpha * pos_attn) / (alpha_sum * self.scale)
+        x:    (B, L, D)
+        gate: (B, H, L, 1)
 
+        We also softly bound the gate into [0.05, 0.95] to avoid extremes.
+        """
+        gate_logits = self.gate_proj(x)                  # (B, L, H)
+        gate = torch.sigmoid(gate_logits)                # (B, L, H)
+        gate = 0.05 + 0.90 * gate                        # keep it away from exact 0/1
+        gate = gate.permute(0, 2, 1).unsqueeze(-1)       # (B, H, L, 1)
+        return gate
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+    ):
+        """
+        Args:
+            x: (B, L, D)
+            attention_mask:
+                optional mask broadcastable to (B, 1, L, L),
+                where masked positions should contain large negative values
+                (e.g. -1e4 or -inf).
+
+        Returns:
+            output: (B, L, D)
+            attn_probs: (B, H, L, L)
+        """
+        bsz, seq_len, d_model = x.size()
+        d_head = d_model // self.num_heads
+
+        if d_model % self.num_heads != 0:
+            raise ValueError(
+                f"d_model ({d_model}) must be divisible by num_heads ({self.num_heads})."
+            )
+
+        # -------------------------
+        # Token projections
+        # -------------------------
+        tok_qkv = self.tok_kqv(x)                        # (B, L, 3D)
+        tok_q, tok_k, tok_v = tok_qkv.chunk(3, dim=-1)  # each (B, L, D)
+
+        tok_q = self._shape(tok_q, seq_len, bsz, d_head)  # (B, H, L, d_head)
+        tok_k = self._shape(tok_k, seq_len, bsz, d_head)  # (B, H, L, d_head)
+        tok_v = self._shape(tok_v, seq_len, bsz, d_head)  # (B, H, L, d_head)
+
+        # token attention scores
+        tok_attn = torch.matmul(tok_q, tok_k.transpose(-1, -2))  # (B, H, L, L)
+
+        # -------------------------
+        # Positional projections
+        # -------------------------
+        pos = self.pos_embed(seq_len) if callable(self.pos_embed) else self.pos_embed
+
+        # Some TUPE implementations return (L, D), some may already be sliced.
+        if pos.dim() != 2:
+            raise ValueError(
+                f"Expected positional embedding to have shape (L, D), got {tuple(pos.shape)}"
+            )
+
+        if pos.size(0) < seq_len:
+            raise ValueError(
+                f"Positional embedding length {pos.size(0)} is smaller than seq_len {seq_len}"
+            )
+
+        pos = pos[:seq_len]                              # (L, D)
+
+        pos_kq = self.pos_kq(pos)                        # (L, 2D)
+        pos_q, pos_k = pos_kq.chunk(2, dim=-1)          # each (L, D)
+
+        pos_q = pos_q.view(seq_len, self.num_heads, d_head).permute(1, 0, 2).contiguous()
+        pos_k = pos_k.view(seq_len, self.num_heads, d_head).permute(1, 0, 2).contiguous()
+        # pos_q, pos_k: (H, L, d_head)
+
+        pos_attn = torch.matmul(pos_q, pos_k.transpose(-1, -2))   # (H, L, L)
+        pos_attn = pos_attn.unsqueeze(0).expand(bsz, -1, -1, -1)  # (B, H, L, L)
+
+        # -------------------------
+        # Relative bias (optional)
+        # -------------------------
         if self.relative_bias:
-            relative_positions = get_relative_positions(
-                seq_len, self.bidirectional, self.num_buckets, self.max_distance
-            ).to(attn.device)
+            rel_pos = get_relative_positions(
+                seq_len,
+                bidirectional=self.bidirectional,
+                num_buckets=self.num_buckets,
+                max_distance=self.max_distance,
+            )  # expected shape: (L, L)
 
-            bias = self.bias(relative_positions + self.max_len)
-            bias = bias.permute(2, 0, 1).unsqueeze(0)
-            attn = attn + bias
+            rel_bias = self.bias(rel_pos)                # (L, L, H)
+            rel_bias = rel_bias.permute(2, 0, 1).unsqueeze(0)  # (1, H, L, L)
+            pos_attn = pos_attn + rel_bias
 
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
+        # -------------------------
+        # Dynamic residual positional gate
+        # -------------------------
+        gate = self._get_gate(x)                         # (B, H, L, 1)
 
-        out = torch.matmul(attn, tok_value)
-        out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
-        out = self.out_proj(out)
-        out = self.dropout(out)
+        # Each query position/head decides how much positional attention to add
+        attn_scores = (tok_attn + gate * pos_attn) / self.scale  # (B, H, L, L)
+
+        # -------------------------
+        # Masking
+        # -------------------------
+        if attention_mask is not None:
+            # expected broadcastable to (B, 1, L, L) or (B, H, L, L)
+            attn_scores = attn_scores + attention_mask
+
+        # -------------------------
+        # Softmax + dropout
+        # -------------------------
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+
+        # -------------------------
+        # Weighted sum of values
+        # -------------------------
+        out = torch.matmul(attn_probs, tok_v)            # (B, H, L, d_head)
+        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, d_model)  # (B, L, D)
+
         return out
