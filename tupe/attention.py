@@ -179,7 +179,6 @@
 
 
 #Gated Positional token
-
 import math
 
 import torch
@@ -192,25 +191,13 @@ from tupe.config import TUPEConfig
 
 class TUPEMultiHeadAttention(nn.Module):
     """
-    TUPE multi-head attention with:
-      1. dynamic gate
-      2. learnable positional strength
-      3. local temporal bias
+    Patched TUPE attention for time-series forecasting.
 
-    Main idea:
-        attn_scores = (
-            tok_attn
-            + pos_beta * gate * pos_attn
-            + local_beta * local_bias
-        ) / scale
-
-    where:
-      - tok_attn   : token/content-based attention
-      - pos_attn   : TUPE positional attention
-      - gate       : dynamic query-wise, head-wise gate
-      - pos_beta   : learnable global strength for positional attention
-      - local_bias : encourages nearby time steps
-      - local_beta : learnable global strength for local bias
+    Changes:
+    - learnable mix between token attention and positional attention
+    - learnable positional strength
+    - local temporal bias to prefer nearer timestamps
+    - recency bias to prefer recent positions
     """
 
     def __init__(self, config: TUPEConfig, pos_embed: nn.Module) -> None:
@@ -225,203 +212,134 @@ class TUPEMultiHeadAttention(nn.Module):
         self.pos_embed = pos_embed
         self.dropout = nn.Dropout(config.dropout)
 
-        self.d_model = config.d_model
-        self.d_head = config.d_head
-
-        if self.d_model % self.num_heads != 0:
-            raise ValueError(
-                f"config.d_model ({self.d_model}) must be divisible by "
-                f"config.num_heads ({self.num_heads})."
-            )
-
-        # Projections
         self.pos_kq = nn.Linear(config.d_model, 2 * config.d_model, bias=False)
         self.tok_kqv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
 
-        # Optional TUPE relative bias
-        self.relative_bias = config.relative_bias
+        self.relative_bias = getattr(config, "relative_bias", False)
         if self.relative_bias:
-            self.bias = nn.Embedding(config.num_buckets, config.num_heads)
+            self.bias = nn.Embedding(self.num_buckets, self.num_heads)
 
-        # Dynamic gate: one gate per query position and head
-        # input  : (B, L, D)
-        # output : (B, L, H)
-        self.gate_proj = nn.Linear(config.d_model, config.num_heads)
+        self.o_proj = nn.Linear(config.d_model, config.d_model, bias=False)
 
-        # Start with modest positional contribution
-        nn.init.zeros_(self.gate_proj.weight)
-        nn.init.constant_(self.gate_proj.bias, -1.5)   # sigmoid(-1.5) ~= 0.18
+        # ---- Added patches ----
+        # learnable mixing between token attention and position attention
+        self.tok_alpha = nn.Parameter(torch.tensor(1.0))
+        self.pos_alpha = nn.Parameter(torch.tensor(0.5))
 
-        # Learnable global positional strength
-        self.pos_beta = nn.Parameter(torch.tensor(0.1))
+        # extra learnable position strength
+        self.pos_strength = nn.Parameter(torch.tensor(0.2))
 
-        # Learnable global local-bias strength
-        self.local_beta = nn.Parameter(torch.tensor(0.5))
+        # local temporal bias strength
+        self.local_bias_strength = nn.Parameter(torch.tensor(0.15))
 
-    def _shape(self, x: torch.Tensor, seq_len: int, bsz: int, d_head: int) -> torch.Tensor:
+        # recency bias strength
+        self.recency_bias_strength = nn.Parameter(torch.tensor(0.10))
+
+        # optional clamp range for stability
+        self.alpha_min = 0.05
+        self.alpha_max = 3.0
+
+    def _shape(self, x: torch.Tensor, seq_len: int, bsz: int) -> torch.Tensor:
+        # (B, L, D) -> (B, H, L, Dh)
+        return x.view(bsz, seq_len, self.num_heads, -1).transpose(1, 2).contiguous()
+
+    def _get_relative_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        rel_pos = get_relative_positions(
+            seq_len,
+            bidirectional=self.bidirectional,
+            num_buckets=self.num_buckets,
+            max_distance=self.max_distance,
+        ).to(device)  # (L, L)
+        values = self.bias(rel_pos)  # (L, L, H)
+        return values.permute(2, 0, 1).contiguous()  # (H, L, L)
+
+    def _build_local_temporal_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """
-        Convert (B, L, D) -> (B, H, L, d_head)
+        Penalize far-away positions so nearby time steps are preferred.
+        Shape: (1, 1, L, L)
         """
-        return x.view(bsz, seq_len, self.num_heads, d_head).transpose(1, 2).contiguous()
+        idx = torch.arange(seq_len, device=device)
+        dist = (idx[None, :] - idx[:, None]).abs().float()  # (L, L)
 
-    def _get_gate(self, x: torch.Tensor) -> torch.Tensor:
+        # normalized negative distance bias
+        dist = dist / max(seq_len - 1, 1)
+        local_bias = -dist * self.local_bias_strength
+        return local_bias.unsqueeze(0).unsqueeze(0)
+
+    def _build_recency_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """
-        Dynamic gate from input states.
-
-        Args:
-            x: (B, L, D)
-
-        Returns:
-            gate: (B, H, L, 1)
+        Slightly favor more recent keys.
+        Shape: (1, 1, 1, L)
         """
-        gate_logits = self.gate_proj(x)                  # (B, L, H)
-        gate = torch.sigmoid(gate_logits)                # (B, L, H)
-
-        # Avoid exact extremes
-        gate = 0.05 + 0.90 * gate                        # in [0.05, 0.95]
-
-        gate = gate.permute(0, 2, 1).unsqueeze(-1)       # (B, H, L, 1)
-        return gate
-
-    def _get_local_bias(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """
-        Local temporal bias encouraging nearby positions.
-
-        Returns:
-            local_bias: (1, 1, L, L)
-
-        Bias form:
-            - abs(i - j) / seq_len
-
-        So nearby positions get less penalty, far positions get more penalty.
-        """
-        positions = torch.arange(seq_len, device=device)
-        dist = positions[None, :] - positions[:, None]   # (L, L)
-        dist = dist.abs().to(dtype)
-
-        # Normalize by seq_len to keep magnitude stable across lengths
-        local_bias = -dist / max(seq_len, 1)             # (L, L)
-        local_bias = local_bias.unsqueeze(0).unsqueeze(0)  # (1, 1, L, L)
-        return local_bias
+        pos = torch.arange(seq_len, device=device).float()
+        pos = pos / max(seq_len - 1, 1)
+        recency = pos * self.recency_bias_strength
+        return recency.view(1, 1, 1, seq_len)
 
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: torch.Tensor = None,
-    ):
+    ) -> torch.Tensor:
         """
-        Args:
-            x: (B, L, D)
-            attention_mask:
-                optional mask broadcastable to (B, 1, L, L) or (B, H, L, L)
-                where masked positions contain large negative values
-                such as -1e4 or -inf.
-
-        Returns:
-            output: (B, L, D)
-            attn_probs: (B, H, L, L)
+        x: (B, L, D)
+        attention_mask:
+            optional mask broadcastable to (B, 1, L, L)
+            masked positions should contain large negative values
         """
-        bsz, seq_len, d_model = x.size()
-        d_head = d_model // self.num_heads
+        bsz, seq_len, dim = x.size()
+        device = x.device
 
-        if d_model != self.d_model:
-            raise ValueError(
-                f"Input d_model ({d_model}) does not match configured d_model ({self.d_model})."
-            )
+        # token projections
+        tok_qkv = self.tok_kqv(x)  # (B, L, 3D)
+        tok_q, tok_k, tok_v = tok_qkv.chunk(3, dim=-1)
 
-        # -------------------------
-        # Token projections
-        # -------------------------
-        tok_qkv = self.tok_kqv(x)                        # (B, L, 3D)
-        tok_q, tok_k, tok_v = tok_qkv.chunk(3, dim=-1)  # each (B, L, D)
+        tok_q = self._shape(tok_q, seq_len, bsz)  # (B, H, L, Dh)
+        tok_k = self._shape(tok_k, seq_len, bsz)
+        tok_v = self._shape(tok_v, seq_len, bsz)
 
-        tok_q = self._shape(tok_q, seq_len, bsz, d_head)   # (B, H, L, d_head)
-        tok_k = self._shape(tok_k, seq_len, bsz, d_head)   # (B, H, L, d_head)
-        tok_v = self._shape(tok_v, seq_len, bsz, d_head)   # (B, H, L, d_head)
+        # positional projections
+        pos = self.pos_embed(seq_len).to(device)  # expected (L, D)
+        pos_kq = self.pos_kq(pos)  # (L, 2D)
+        pos_k, pos_q = pos_kq.chunk(2, dim=-1)
 
+        pos_q = pos_q.view(seq_len, self.num_heads, -1).transpose(0, 1).contiguous()  # (H, L, Dh)
+        pos_k = pos_k.view(seq_len, self.num_heads, -1).transpose(0, 1).contiguous()  # (H, L, Dh)
+
+        # token attention
         tok_attn = torch.matmul(tok_q, tok_k.transpose(-1, -2))  # (B, H, L, L)
 
-        # -------------------------
-        # Positional projections
-        # -------------------------
-        pos = self.pos_embed(seq_len) if callable(self.pos_embed) else self.pos_embed
+        # positional attention
+        pos_attn = torch.matmul(pos_q, pos_k.transpose(-1, -2))  # (H, L, L)
+        pos_attn = pos_attn.unsqueeze(0)  # (1, H, L, L)
 
-        if pos.dim() != 2:
-            raise ValueError(
-                f"Expected positional embedding shape (L, D), got {tuple(pos.shape)}"
-            )
+        # stabilize learnable weights
+        tok_alpha = torch.clamp(self.tok_alpha, self.alpha_min, self.alpha_max)
+        pos_alpha = torch.clamp(self.pos_alpha, self.alpha_min, self.alpha_max)
+        pos_strength = torch.clamp(self.pos_strength, 0.0, 2.0)
 
-        if pos.size(0) < seq_len:
-            raise ValueError(
-                f"Positional embedding length {pos.size(0)} is smaller than seq_len {seq_len}"
-            )
+        # combine token and positional attention
+        attn = (tok_alpha * tok_attn + (pos_alpha + pos_strength) * pos_attn) / self.scale
 
-        pos = pos[:seq_len]                              # (L, D)
-
-        pos_kq = self.pos_kq(pos)                        # (L, 2D)
-        pos_q, pos_k = pos_kq.chunk(2, dim=-1)          # each (L, D)
-
-        pos_q = pos_q.view(seq_len, self.num_heads, d_head).permute(1, 0, 2).contiguous()
-        pos_k = pos_k.view(seq_len, self.num_heads, d_head).permute(1, 0, 2).contiguous()
-        # (H, L, d_head)
-
-        pos_attn = torch.matmul(pos_q, pos_k.transpose(-1, -2))   # (H, L, L)
-        pos_attn = pos_attn.unsqueeze(0).expand(bsz, -1, -1, -1)  # (B, H, L, L)
-
-        # -------------------------
-        # Optional TUPE relative bias
-        # -------------------------
+        # add relative bias if enabled
         if self.relative_bias:
-            rel_pos = get_relative_positions(
-                seq_len,
-                bidirectional=self.bidirectional,
-                num_buckets=self.num_buckets,
-                max_distance=self.max_distance,
-            )  # expected (L, L)
+            rel_bias = self._get_relative_bias(seq_len, device)  # (H, L, L)
+            attn = attn + rel_bias.unsqueeze(0)
 
-            rel_bias = self.bias(rel_pos)                        # (L, L, H)
-            rel_bias = rel_bias.permute(2, 0, 1).unsqueeze(0)    # (1, H, L, L)
-            pos_attn = pos_attn + rel_bias
+        # add local temporal bias
+        attn = attn + self._build_local_temporal_bias(seq_len, device)
 
-        # -------------------------
-        # Dynamic gate
-        # -------------------------
-        gate = self._get_gate(x)                         # (B, H, L, 1)
+        # add recency bias
+        attn = attn + self._build_recency_bias(seq_len, device)
 
-        # -------------------------
-        # Local temporal bias
-        # -------------------------
-        local_bias = self._get_local_bias(
-            seq_len=seq_len,
-            device=x.device,
-            dtype=tok_attn.dtype,
-        )  # (1, 1, L, L)
-
-        # -------------------------
-        # Combine attention components
-        # -------------------------
-        attn_scores = (
-            tok_attn
-            + self.pos_beta * gate * pos_attn
-            + self.local_beta * local_bias
-        ) / self.scale
-
-        # -------------------------
-        # Apply mask
-        # -------------------------
+        # external attention mask
         if attention_mask is not None:
-            attn_scores = attn_scores + attention_mask
+            attn = attn + attention_mask
 
-        # -------------------------
-        # Softmax + dropout
-        # -------------------------
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_probs = self.dropout(attn_probs)
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
 
-        # -------------------------
-        # Weighted sum
-        # -------------------------
-        out = torch.matmul(attn_probs, tok_v)            # (B, H, L, d_head)
-        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, d_model)
-
+        out = torch.matmul(attn, tok_v)  # (B, H, L, Dh)
+        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, dim)  # (B, L, D)
+        out = self.o_proj(out)
         return out
