@@ -192,20 +192,25 @@ from tupe.config import TUPEConfig
 
 class TUPEMultiHeadAttention(nn.Module):
     """
-    TUPE attention with dynamic residual positional gating.
+    TUPE multi-head attention with:
+      1. dynamic gate
+      2. learnable positional strength
+      3. local temporal bias
 
-    Instead of:
-        attn = (tok_alpha * tok_attn + pos_alpha * pos_attn) / scale
+    Main idea:
+        attn_scores = (
+            tok_attn
+            + pos_beta * gate * pos_attn
+            + local_beta * local_bias
+        ) / scale
 
-    we use:
-        attn = (tok_attn + gate * pos_attn) / scale
-
-    where gate is learned dynamically from the input x.
-
-    Why this is safer:
-    - token attention remains dominant
-    - positional attention helps only when useful
-    - less risk of positional over-dominance hurting forecasting
+    where:
+      - tok_attn   : token/content-based attention
+      - pos_attn   : TUPE positional attention
+      - gate       : dynamic query-wise, head-wise gate
+      - pos_beta   : learnable global strength for positional attention
+      - local_bias : encourages nearby time steps
+      - local_beta : learnable global strength for local bias
     """
 
     def __init__(self, config: TUPEConfig, pos_embed: nn.Module) -> None:
@@ -220,25 +225,38 @@ class TUPEMultiHeadAttention(nn.Module):
         self.pos_embed = pos_embed
         self.dropout = nn.Dropout(config.dropout)
 
-        # kqv in one pass
+        self.d_model = config.d_model
+        self.d_head = config.d_head
+
+        if self.d_model % self.num_heads != 0:
+            raise ValueError(
+                f"config.d_model ({self.d_model}) must be divisible by "
+                f"config.num_heads ({self.num_heads})."
+            )
+
+        # Projections
         self.pos_kq = nn.Linear(config.d_model, 2 * config.d_model, bias=False)
         self.tok_kqv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
 
+        # Optional TUPE relative bias
         self.relative_bias = config.relative_bias
-        if config.relative_bias:
+        if self.relative_bias:
             self.bias = nn.Embedding(config.num_buckets, config.num_heads)
 
-        # Dynamic gate:
-        # produces one gate per head for each query position
-        # input:  (B, L, D)
-        # output: (B, L, H)
+        # Dynamic gate: one gate per query position and head
+        # input  : (B, L, D)
+        # output : (B, L, H)
         self.gate_proj = nn.Linear(config.d_model, config.num_heads)
 
-        # Initialize gate to start with SMALL positional contribution.
-        # sigmoid(-1.5) ~= 0.18
-        # So initially: attn ≈ tok_attn + 0.18 * pos_attn
+        # Start with modest positional contribution
         nn.init.zeros_(self.gate_proj.weight)
-        nn.init.constant_(self.gate_proj.bias, -1.5)
+        nn.init.constant_(self.gate_proj.bias, -1.5)   # sigmoid(-1.5) ~= 0.18
+
+        # Learnable global positional strength
+        self.pos_beta = nn.Parameter(torch.tensor(0.1))
+
+        # Learnable global local-bias strength
+        self.local_beta = nn.Parameter(torch.tensor(0.5))
 
     def _shape(self, x: torch.Tensor, seq_len: int, bsz: int, d_head: int) -> torch.Tensor:
         """
@@ -248,18 +266,43 @@ class TUPEMultiHeadAttention(nn.Module):
 
     def _get_gate(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Compute dynamic gate from input states.
+        Dynamic gate from input states.
 
-        x:    (B, L, D)
-        gate: (B, H, L, 1)
+        Args:
+            x: (B, L, D)
 
-        We also softly bound the gate into [0.05, 0.95] to avoid extremes.
+        Returns:
+            gate: (B, H, L, 1)
         """
         gate_logits = self.gate_proj(x)                  # (B, L, H)
         gate = torch.sigmoid(gate_logits)                # (B, L, H)
-        gate = 0.05 + 0.90 * gate                        # keep it away from exact 0/1
+
+        # Avoid exact extremes
+        gate = 0.05 + 0.90 * gate                        # in [0.05, 0.95]
+
         gate = gate.permute(0, 2, 1).unsqueeze(-1)       # (B, H, L, 1)
         return gate
+
+    def _get_local_bias(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """
+        Local temporal bias encouraging nearby positions.
+
+        Returns:
+            local_bias: (1, 1, L, L)
+
+        Bias form:
+            - abs(i - j) / seq_len
+
+        So nearby positions get less penalty, far positions get more penalty.
+        """
+        positions = torch.arange(seq_len, device=device)
+        dist = positions[None, :] - positions[:, None]   # (L, L)
+        dist = dist.abs().to(dtype)
+
+        # Normalize by seq_len to keep magnitude stable across lengths
+        local_bias = -dist / max(seq_len, 1)             # (L, L)
+        local_bias = local_bias.unsqueeze(0).unsqueeze(0)  # (1, 1, L, L)
+        return local_bias
 
     def forward(
         self,
@@ -270,9 +313,9 @@ class TUPEMultiHeadAttention(nn.Module):
         Args:
             x: (B, L, D)
             attention_mask:
-                optional mask broadcastable to (B, 1, L, L),
-                where masked positions should contain large negative values
-                (e.g. -1e4 or -inf).
+                optional mask broadcastable to (B, 1, L, L) or (B, H, L, L)
+                where masked positions contain large negative values
+                such as -1e4 or -inf.
 
         Returns:
             output: (B, L, D)
@@ -281,9 +324,9 @@ class TUPEMultiHeadAttention(nn.Module):
         bsz, seq_len, d_model = x.size()
         d_head = d_model // self.num_heads
 
-        if d_model % self.num_heads != 0:
+        if d_model != self.d_model:
             raise ValueError(
-                f"d_model ({d_model}) must be divisible by num_heads ({self.num_heads})."
+                f"Input d_model ({d_model}) does not match configured d_model ({self.d_model})."
             )
 
         # -------------------------
@@ -292,11 +335,10 @@ class TUPEMultiHeadAttention(nn.Module):
         tok_qkv = self.tok_kqv(x)                        # (B, L, 3D)
         tok_q, tok_k, tok_v = tok_qkv.chunk(3, dim=-1)  # each (B, L, D)
 
-        tok_q = self._shape(tok_q, seq_len, bsz, d_head)  # (B, H, L, d_head)
-        tok_k = self._shape(tok_k, seq_len, bsz, d_head)  # (B, H, L, d_head)
-        tok_v = self._shape(tok_v, seq_len, bsz, d_head)  # (B, H, L, d_head)
+        tok_q = self._shape(tok_q, seq_len, bsz, d_head)   # (B, H, L, d_head)
+        tok_k = self._shape(tok_k, seq_len, bsz, d_head)   # (B, H, L, d_head)
+        tok_v = self._shape(tok_v, seq_len, bsz, d_head)   # (B, H, L, d_head)
 
-        # token attention scores
         tok_attn = torch.matmul(tok_q, tok_k.transpose(-1, -2))  # (B, H, L, L)
 
         # -------------------------
@@ -304,10 +346,9 @@ class TUPEMultiHeadAttention(nn.Module):
         # -------------------------
         pos = self.pos_embed(seq_len) if callable(self.pos_embed) else self.pos_embed
 
-        # Some TUPE implementations return (L, D), some may already be sliced.
         if pos.dim() != 2:
             raise ValueError(
-                f"Expected positional embedding to have shape (L, D), got {tuple(pos.shape)}"
+                f"Expected positional embedding shape (L, D), got {tuple(pos.shape)}"
             )
 
         if pos.size(0) < seq_len:
@@ -322,13 +363,13 @@ class TUPEMultiHeadAttention(nn.Module):
 
         pos_q = pos_q.view(seq_len, self.num_heads, d_head).permute(1, 0, 2).contiguous()
         pos_k = pos_k.view(seq_len, self.num_heads, d_head).permute(1, 0, 2).contiguous()
-        # pos_q, pos_k: (H, L, d_head)
+        # (H, L, d_head)
 
         pos_attn = torch.matmul(pos_q, pos_k.transpose(-1, -2))   # (H, L, L)
         pos_attn = pos_attn.unsqueeze(0).expand(bsz, -1, -1, -1)  # (B, H, L, L)
 
         # -------------------------
-        # Relative bias (optional)
+        # Optional TUPE relative bias
         # -------------------------
         if self.relative_bias:
             rel_pos = get_relative_positions(
@@ -336,25 +377,39 @@ class TUPEMultiHeadAttention(nn.Module):
                 bidirectional=self.bidirectional,
                 num_buckets=self.num_buckets,
                 max_distance=self.max_distance,
-            )  # expected shape: (L, L)
+            )  # expected (L, L)
 
-            rel_bias = self.bias(rel_pos)                # (L, L, H)
-            rel_bias = rel_bias.permute(2, 0, 1).unsqueeze(0)  # (1, H, L, L)
+            rel_bias = self.bias(rel_pos)                        # (L, L, H)
+            rel_bias = rel_bias.permute(2, 0, 1).unsqueeze(0)    # (1, H, L, L)
             pos_attn = pos_attn + rel_bias
 
         # -------------------------
-        # Dynamic residual positional gate
+        # Dynamic gate
         # -------------------------
         gate = self._get_gate(x)                         # (B, H, L, 1)
 
-        # Each query position/head decides how much positional attention to add
-        attn_scores = (tok_attn + gate * pos_attn) / self.scale  # (B, H, L, L)
+        # -------------------------
+        # Local temporal bias
+        # -------------------------
+        local_bias = self._get_local_bias(
+            seq_len=seq_len,
+            device=x.device,
+            dtype=tok_attn.dtype,
+        )  # (1, 1, L, L)
 
         # -------------------------
-        # Masking
+        # Combine attention components
+        # -------------------------
+        attn_scores = (
+            tok_attn
+            + self.pos_beta * gate * pos_attn
+            + self.local_beta * local_bias
+        ) / self.scale
+
+        # -------------------------
+        # Apply mask
         # -------------------------
         if attention_mask is not None:
-            # expected broadcastable to (B, 1, L, L) or (B, H, L, L)
             attn_scores = attn_scores + attention_mask
 
         # -------------------------
@@ -364,9 +419,9 @@ class TUPEMultiHeadAttention(nn.Module):
         attn_probs = self.dropout(attn_probs)
 
         # -------------------------
-        # Weighted sum of values
+        # Weighted sum
         # -------------------------
         out = torch.matmul(attn_probs, tok_v)            # (B, H, L, d_head)
-        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, d_model)  # (B, L, D)
+        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, d_model)
 
         return out
