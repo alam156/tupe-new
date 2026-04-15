@@ -114,7 +114,7 @@ class TUPEMultiHeadAttention(nn.Module):
 
         # learn how much token attention and positional attention should contribute
         self.tok_alpha = nn.Parameter(torch.tensor(1.0))
-        self.pos_alpha = nn.Parameter(torch.tensor(0.6))
+        self.pos_alpha = nn.Parameter(torch.tensor(0.3))
 
         self.relative_bias = config.relative_bias
         if config.relative_bias:
@@ -146,7 +146,9 @@ class TUPEMultiHeadAttention(nn.Module):
         )
         tok_attn = torch.matmul(tok_query, tok_key)
 
-        attn = (self.tok_alpha * tok_attn + self.pos_alpha * pos_attn) / self.scale
+        #attn = (self.tok_alpha * tok_attn + self.pos_alpha * pos_attn) / self.scale
+        alpha_sum = self.tok_alpha + self.pos_alpha
+        attn = (self.tok_alpha * tok_attn + self.pos_alpha * pos_attn) / (alpha_sum * self.scale)
 
         if self.relative_bias:
             relative_positions = get_relative_positions(
