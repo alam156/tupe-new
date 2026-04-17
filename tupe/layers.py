@@ -8,21 +8,28 @@ from tupe.attention import TUPEMultiHeadAttention
 from tupe.config import TUPEConfig
 
 
+# class AbsolutePositionalEmbedding(nn.Module):
+#     def __init__(self, d_model: int, max_len: int) -> None:
+#         super().__init__()
+#         pe = torch.empty(max_len, d_model)
+#         position = torch.arange(0, max_len).float().unsqueeze(1)
+#         div_term = torch.exp(
+#             torch.arange(0, d_model, 2).float() * (-math.log(10000) / d_model)
+#         )
+#         pe[:, 0::2] = torch.sin(position * div_term)
+#         pe[:, 1::2] = torch.cos(position * div_term)
+#         pe = pe.unsqueeze(0)
+#         self.register_buffer("pe", pe)
+#
+#     def forward(self, seq_len: int) -> torch.tensor:
+#         # shape (1, seq_len, d_model)
+#         return self.pe[:, :seq_len]
 class AbsolutePositionalEmbedding(nn.Module):
     def __init__(self, d_model: int, max_len: int) -> None:
         super().__init__()
-        pe = torch.empty(max_len, d_model)
-        position = torch.arange(0, max_len).float().unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer("pe", pe)
+        self.pe = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
 
-    def forward(self, seq_len: int) -> torch.tensor:
-        # shape (1, seq_len, d_model)
+    def forward(self, seq_len: int) -> torch.Tensor:
         return self.pe[:, :seq_len]
 
 
