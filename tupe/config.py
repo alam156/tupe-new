@@ -34,8 +34,8 @@ class TUPEConfig:
 
     relative_bias: bool = True
     bidirectional_bias: bool = False   # important for forecasting
-    num_buckets: int = 16
-    max_distance: int = 16
+    num_buckets: int = 8
+    max_distance: int = 8
 
     def __post_init__(self):
         d_head, remainder = divmod(self.d_model, self.num_heads)
