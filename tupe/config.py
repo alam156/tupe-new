@@ -5,7 +5,7 @@ from dataclasses import dataclass
 class TUPEConfig:
     num_layers: int = 6
     num_heads: int = 8
-    d_model: int = 256
+    d_model: int = 128
     d_head: int = 0
     max_len: int = 256
     dropout: float = 0.1
